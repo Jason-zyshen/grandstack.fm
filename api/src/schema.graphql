@@ -1,0 +1,231 @@
+# type User {
+#   userId: ID!
+#   name: String
+#   reviews: [Review] @relation(name: "WROTE", direction: OUT)
+#   avgStars: Float
+#     @cypher(
+#       statement: "MATCH (this)-[:WROTE]->(r:Review) RETURN toFloat(avg(r.stars))"
+#     )
+#   numReviews: Int
+#     @cypher(statement: "MATCH (this)-[:WROTE]->(r:Review) RETURN COUNT(r)")
+#   recommendations(first: Int = 3): [Business]
+#     @cypher(
+#       statement: "MATCH (this)-[:WROTE]->(r:Review)-[:REVIEWS]->(:Business)<-[:REVIEWS]-(:Review)<-[:WROTE]-(:User)-[:WROTE]->(:Review)-[:REVIEWS]->(rec:Business) WHERE NOT EXISTS( (this)-[:WROTE]->(:Review)-[:REVIEWS]->(rec) ) WITH rec, COUNT(*) AS num ORDER BY num DESC LIMIT $first RETURN rec"
+#     )
+# }
+
+# type Business {
+#   businessId: ID!
+#   name: String!
+#   address: String
+#   city: String
+#   state: String
+#   location: Point
+#   avgStars: Float
+#     @cypher(
+#       statement: "MATCH (this)<-[:REVIEWS]-(r:Review) RETURN coalesce(avg(r.stars),0.0)"
+#     )
+#   reviews: [Review] @relation(name: "REVIEWS", direction: IN)
+#   categories: [Category] @relation(name: "IN_CATEGORY", direction: OUT)
+# }
+
+# type Review {
+#   reviewId: ID!
+#   stars: Float
+#   text: String
+#   date: Date
+#   business: Business @relation(name: "REVIEWS", direction: OUT)
+#   user: User @relation(name: "WROTE", direction: IN)
+# }
+
+# type Category {
+#   name: ID!
+#   businesses: [Business] @relation(name: "IN_CATEGORY", direction: IN)
+# }
+
+# type RatingCount {
+#   stars: Float!
+#   count: Int!
+# }
+
+# type Mutation {
+#   mergeBusinessCategory(categories: [String!]!, businessId: ID!): Business
+#     @cypher(
+#       statement: "MATCH (b:Business {businessId: $businessId}) UNWIND $categories AS cat MERGE (c:Category {name: cat}) MERGE (b)-[:IN_CATEGORY]->(c) RETURN b"
+#     )
+# }
+
+# type Query {
+#   userCount: Int! @cypher(statement: "MATCH (u:User) RETURN COUNT(u)")
+#   ratingsCount: [RatingCount]
+#     @cypher(
+#       statement: "MATCH (r:Review) WITH r.stars AS stars, COUNT(*) AS count ORDER BY stars RETURN {stars: stars, count: count}"
+#     )
+# }
+
+type Query {
+  podcastSearch(searchTerm: String!): [PodcastSearchResult]
+    @cypher(
+      statement: """
+      WITH toString(timestamp()/1000) AS timestamp
+      WITH {
+        `User-Agent`: "GRANDstackFM",
+        `X-Auth-Date`: timestamp,
+        `X-Auth-Key`: apoc.static.get('podcastkey'),
+        `Authorization`: apoc.util.sha1([apoc.static.get('podcastkey') + apoc.static.get('podcastsecret') + timestamp])
+      } AS headers
+      CALL apoc.load.jsonParams("https://api.podcastindex.org/api/1.0/search/byterm?q=" + apoc.text.urlencode($searchTerm), headers, '', '') YIELD value
+      UNWIND value.feeds AS feed
+      RETURN {
+        itunesId: feed.itunesId,
+        title: feed.title,
+        description: feed.description,
+        feedURL: feed.url,
+        artwork: feed.artwork,
+        categories: apoc.map.values(feed.categories, keys(feed.categories))
+      }
+      """
+    )
+  currentUser: User
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})
+      RETURN u
+      """
+    )
+  subscribedPodcasts: [Podcast]
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})-[:SUBSCRIBES_TO]->(p:Podcast)
+      RETURN p
+      """
+    )
+  episodeFeed(first: Int = 10, offset: Int = 0): [Episode]
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})-[:SUBSCRIBES_TO]->(p:Podcast)-[:HAS_EPISODE]->(e:Episode)
+      RETURN e ORDER BY e.pubDate DESC SKIP toInteger($offset) LIMIT toInteger($first)
+      """
+    )
+  playlists: [Playlist]
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})-[:OWNS]->(p:Playlist)
+      RETURN p
+      """
+    )
+}
+
+type Mutation {
+  signup(username: String!, password: String!): AuthToken
+  login(username: String!, password: String!): AuthToken
+  subscribeToPodcast(itunesId: String!): Podcast
+    @cypher(
+      statement: """
+      // First we fetch the podcast details from the podcast index
+      WITH toString(timestamp()/1000) AS timestamp
+      WITH {
+        `User-Agent`: "GRANDstackFM",
+        `X-Auth-Date`: timestamp,
+        `X-Auth-Key`: apoc.static.get('podcastkey'),
+        `Authorization`: apoc.util.sha1([apoc.static.get('podcastkey') + apoc.static.get('podcastsecret') + timestamp])
+      } AS headers
+      CALL apoc.load.jsonParams("https://api.podcastindex.org/api/1.0/podcasts/byitunesid?id=" + apoc.text.urlencode($itunesId), headers, '', '') YIELD value
+      WITH value.feed AS feed
+
+      // Next we create the (:User)-[:SUBSCRIBES_TO]->(:Podcast) path in the database
+      MATCH (u:User {id: $cypherParams.userId})
+      MERGE (p:Podcast {itunesId: $itunesId})
+      SET p.title       = feed.title,
+          p.link        = feed.link,
+          p.description = feed.description,
+          p.feedURL     = feed.url,
+          p.image       = feed.artwork
+      MERGE (u)-[:SUBSCRIBES_TO]->(p)
+      WITH p
+
+      // Now we parse the podcast XML feed and add its episodes to the database
+      // (:Podcast)-[:HAS_EPISODE]->(:Episode)
+      CALL apoc.load.xml(p.feedURL) YIELD value
+      UNWIND value._children AS foo
+      WITH p,[x in foo._children WHERE x._type = \"item\"] AS episodes
+      UNWIND episodes AS episode
+      WITH p,[x in episode._children WHERE x._type =\"title\"][0]._text AS title,
+          [x in episode._children WHERE x._type =\"description\"][0]._text AS summary,
+          [x in episode._children WHERE x._type=\"link\"][0]._text AS link,
+          [x in episode._children WHERE x._type=\"image\"][0].href AS image,
+          [x in episode._children WHERE x._type=\"enclosure\" AND x.type CONTAINS \"audio\" ][0].url AS audio,
+          [x in episode._children WHERE x._type=\"pubDate\"][0]._text AS pubDate,
+          [x in episode._children WHERE x._type =\"guid\"][0]._text AS guid
+      MERGE (e:Episode {id: guid})
+      SET e.title = title,
+          e.summary = summary,
+          e.link = link,
+          e.image = image,
+          e.audio = audio,
+          e.pubDate = dateTime({epochMillis: apoc.date.parse(pubDate, 'ms', 'EEE, dd MMM yyyy HH:mm:ss zzz')})
+      MERGE (e)<-[:HAS_EPISODE]-(p)
+      RETURN p
+      """
+    )
+  createPlaylist(name: String!): Playlist
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})
+      MERGE (p:Playlist {name: $name})<-[:OWNS]-(u)
+      RETURN p
+      """
+    )
+  addEpisodeToPlaylist(name: String!, episodeId: ID!): Playlist
+    @cypher(
+      statement: """
+      MATCH (u:User {id: $cypherParams.userId})-[:OWNS]->(p:Playlist {name: $name})
+      MATCH (e:Episode {id: $episodeId})
+      MERGE (e)-[:IN_PLAYLIST]->(p)
+      RETURN p
+      """
+    )
+}
+
+type User {
+  username: String
+  id: ID!
+}
+
+type AuthToken {
+  token: String!
+}
+
+type PodcastSearchResult {
+  itunesId: String
+  title: String
+  description: String
+  feedURL: String
+  artwork: String
+  categories: [String]
+}
+
+type Podcast {
+  itunesId: ID!
+  title: String
+  link: String
+  feedURL: String
+  description: String
+  image: String
+}
+
+type Episode {
+  id: ID!
+  pubDate: DateTime
+  summary: String
+  title: String
+  link: String
+  image: String
+  audio: String
+  podcast: Podcast @relation(name: "HAS_EPISODE", direction: IN)
+}
+
+type Playlist {
+  name: String
+  episode: [Episode] @relation(name: "IN_PLAYLIST", direction: IN)
+}
